@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+# https://boto3.readthedocs.io/en/latest/reference/services/organizations.html#client
+"""
+This will get the input and query all accounts within AWS Organizations.
+input: stdin
+output: dict with id(str):hash(str)
+"""
+
+from __future__ import print_function
+import boto3
+import sys
+import json
+import yaml
+import hashlib
+
+
+# Since reading stdout can only be performed once, we do it on initialization
+save_stdin = json.loads(sys.stdin.read())
+
+# Check mandatory parameters and error out if missing
+
+if "'assumerole':" not in str(save_stdin):
+    print("No mandatory assumerole parameter is given")
+    sys.exit(1)
+if "'organization_account':" not in str(save_stdin):
+    print("No mandatory organization_account parameter is given")
+    sys.exit(1)
+
+def role_arn(assume_role, organization_account_id):
+    """
+    Generate the role arn to assume
+
+    inputs: assume_role (str)
+            organization_account_id(int)
+    output: iam role arn (str)
+    """
+    # build arn for role
+    return str("arn:aws:iam::" + str(organization_account_id) + ":role/" + assume_role)
+
+def role_arn_to_session(**args):
+    """
+    Assume a role
+
+    inputs:  RoleArn(str)
+             RoleSessionName(str)
+             boto3.client.assume_role(**args)
+    outputs: boto3.Session
+    usage  :
+            session = role_arn_to_session(
+                RoleArn='arn:aws:iam::012345678901:role/example-role',
+                RoleSessionName='ExampleSessionName')
+            client = session.client('organizations')
+    """
+    client = boto3.client('sts')
+    response = client.assume_role(**args)
+    return boto3.Session(
+        aws_access_key_id=response['Credentials']['AccessKeyId'],
+        aws_secret_access_key=response['Credentials']['SecretAccessKey'],
+        aws_session_token=response['Credentials']['SessionToken'])
+
+def describe_organization():
+    """
+    Generate a org accounts config file using AWS Organizations.
+    This method looks up data from the stdin and describes the organizations
+    accounts using the methods
+    role_arn
+    role_arn_to_session
+    get_ou_from_path
+    get_accounts_for_ou
+    where the last method leverages get_sub_ous
+    inputs: -
+    output: list of accounts for given paths
+    """
+    # Role template for accounts in the config
+    if "'rolename':" not in str(save_stdin):
+        rolename = "tf-admin"
+        print("Rolename is defaulted to " + str(rolename), file=sys.stderr)
+    else:
+        rolename = list(save_stdin['source']['rolename'])
+        print("Rolename set is " + str(rolename), file=sys.stderr)
+
+    role = str("arn:aws:iam::{Id}:role/" + rolename)
+
+    # needed to setup the session to the org
+    assume_role = str(save_stdin['source']['assumerole'])
+    organization_account_id = str(save_stdin['source']['organization_account'])
+
+    # If scope is specified, take only the tree for a specific scope. Otherwise use the default root path ("/")
+    # scope does support multiple entries in the format list
+    if "'scope':" not in str(save_stdin):
+        ou = "/"
+        print("Scope set is root", file=sys.stderr)
+    else:
+        ou = list(save_stdin['source']['scope'])
+        print("Scope is set to the following list of paths: " + str(ou), file=sys.stderr)
+
+    # If active is specified to true, get only active accounts. Defaults to False
+    if "'active':" not in str(save_stdin):
+        active = False
+    else:
+        if str(save_stdin['source']['active']) in ["True","true",True]:
+            active = True
+        else:
+            active = False
+    print("Only include active accounts : " + str(active), file=sys.stderr)
+
+    # set the role arn
+    role_arn_str = role_arn(assume_role, organization_account_id)
+
+    # set the session to assume role
+    session = role_arn_to_session(
+        RoleArn=role_arn_str,
+        RoleSessionName='listAccountsSession')
+
+    # build session
+    client = session.client('organizations')
+
+    # lets go
+    accounts = []
+    for path in ou:
+        print("Querying out path " + path, file=sys.stderr)
+        ou = get_ou_from_path(client, path)
+        accounts.extend(get_accounts_for_ou(client, ou, active))
+
+    results = []
+    for a in accounts:
+        tags = []
+        path_parts = a['Path'].strip('/').split('/')
+        for idx, _ in enumerate(path_parts):
+            tags.append("path:/%s" % "/".join(path_parts[:idx + 1]))
+
+        ainfo = {
+            'account_id': a['Id'],
+            'email': a['Email'],
+            'name': a['Name'],
+            'paths': tags,
+            'role': role.format(**a)}
+        results.append(ainfo)
+
+    results = yaml.safe_dump(
+            {'accounts': results},
+            default_flow_style=False
+        )
+
+    return results
+
+
+def get_ou_from_path(client, path):
+    """
+    use the path to find the ou id
+
+    inputs:  client (the session)
+             path(str)
+
+    outputs: ou
+    """
+    ou = client.list_roots()['Roots'][0]
+
+    if path == "/":
+        ou['Path'] = path
+        return ou
+
+    ou_pager = client.get_paginator('list_organizational_units_for_parent')
+    for part in path.strip('/').split('/'):
+        found = False
+        for page in ou_pager.paginate(ParentId=ou['Id']):
+            for child in page.get('OrganizationalUnits'):
+                if child['Name'] == part:
+                    found = True
+                    ou = child
+                    break
+            if found:
+                break
+        if found is False:
+            raise ValueError(
+                "No OU named:%r found in path: %s" % (
+                    path, path))
+    ou['Path'] = path
+    return ou
+
+
+def get_accounts_for_ou(client, ou, active, recursive=True):
+    """
+    use the ou to find the accounts under it.
+    Also find sub ous then list their accounts
+
+    inputs:  client (the session)
+             ou(str)
+             active(bool)
+             recursive(bool)
+
+    outputs: results(list) list of accounts
+    """
+    results = []
+    ous = [ou]
+    if recursive:
+        ous = get_sub_ous(client, ou)
+
+    account_pager = client.get_paginator('list_accounts_for_parent')
+    for ou in ous:
+        for a in account_pager.paginate(
+            ParentId=ou['Id']).build_full_result().get(
+                'Accounts', []):
+            a['Path'] = ou['Path']
+            if active:
+                if a['Status'] == 'ACTIVE':
+                    results.append(a)
+            else:
+                results.append(a)
+    return results
+
+def get_sub_ous(client, ou):
+    """
+    Find sub ous then list their accounts
+
+    inputs:  client (the session)
+             ou(str)
+
+    outputs: results(list) list of sub ous
+    """
+    results = [ou]
+    ou_pager = client.get_paginator('list_organizational_units_for_parent')
+    for sub_ou in ou_pager.paginate(
+            ParentId=ou['Id']).build_full_result().get(
+                'OrganizationalUnits'):
+        sub_ou['Path'] = "/%s/%s" % (ou['Path'].strip('/'), sub_ou['Name'])
+        results.extend(get_sub_ous(client, sub_ou))
+    return results
+
+def return_hash():
+    """
+    Generate a file called "$1/org-accounts.yml" with all accounts from the organization
+
+    inputs: host path to output files (str)
+    output: AWS Organizations account list (file, json)
+    """
+    accounts = describe_organization()
+
+    # Hashes can only be created from str
+    json_response = json.dumps(accounts, default=str)
+
+    hash_object  = hashlib.sha256(json_response.encode('utf-8'))
+    hex_dig = hash_object.hexdigest()
+
+    # Generate output
+    output_list = []
+    versions = {}
+    versions['id'] = hex_dig
+
+    output_list.append(versions)
+
+    # print(json.dumps(output_list, default=str), file=sys.stderr)
+    return json.dumps(output_list, default=str)
+
+print(str(return_hash()))
+
